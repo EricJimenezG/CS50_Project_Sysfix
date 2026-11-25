@@ -1,4 +1,9 @@
+/*  CS50 Final Project: Windows Diagnostic & Repair Tool (Sysfix)
+    Created by: Eric Jimenez Garcia
+*/
+
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <windows.h>
 
@@ -9,12 +14,23 @@
 #define COLOR_RED    "\033[1;31m"
 #define COLOR_YELLOW "\033[1;33m"
 
+// Data Struct to track cache and temporary file cleanup metrics
+typedef struct
+{
+    unsigned long files_deleted;
+    unsigned long files_skipped;
+    unsigned long long bytes_freed;
+} CleanupStats;
+
+
 // Function Prototypes
 int check_admin_privileges(void);
 void display_menu(void);
 void execute_quick_Netscan(void);
 int run_piped_command(const char *command);
 void execute_deep_repair(void);
+void clean_directory_contents(const char *dir_path, int remove_self, CleanupStats *stats);
+void execute_cache_cleanup(void);
 
 // Main Application Loop
 int main(void) {
@@ -58,7 +74,7 @@ int main(void) {
                 execute_deep_repair();
                 break;
             case 3:
-                printf(COLOR_YELLOW "\n[INFO] Cache & Temp Clearing - Coming Soon...\n\n" COLOR_RESET);
+                execute_cache_cleanup();
                 break;
             case 4:
                 printf(COLOR_YELLOW "\n[INFO] Generate Diagnostic Log - Coming Soon...\n\n" COLOR_RESET);
@@ -241,3 +257,159 @@ void execute_deep_repair(void)
         printf(COLOR_YELLOW "[INFO] Repair finished (DISM code: %d, SFC code: %d). Check Option 4 logs for details.\n\n" COLOR_RESET, dism_status, sfc_status);
     }
 }
+
+// Helper function to recursively delete temporary files while safely skipping locked files
+// Note: Win32 directory traversal logic developed with assistance from Gemini AI
+void clean_directory_contents(const char *dir_path, int remove_self, CleanupStats *stats)
+{
+    char base_path[MAX_PATH];
+    strncpy(base_path, dir_path, MAX_PATH - 1);
+    base_path[MAX_PATH - 1] = '\0';
+
+    // Strip trailing backslash if present
+    size_t len = strlen(base_path);
+    while (len > 0 && (base_path[len - 1] == '\\' || base_path[len - 1] == '/'))
+    {
+        base_path[len - 1] = '\0';
+        len--;
+    }
+
+    char search_path[MAX_PATH];
+    if (snprintf(search_path, sizeof(search_path), "%s\\*", base_path) >= MAX_PATH)
+    {
+        return;
+    }
+
+    WIN32_FIND_DATAA find_data;
+    HANDLE hFind = FindFirstFileA(search_path, &find_data);
+    if (hFind == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    do
+    {
+        // Skip current and parent directory entries
+        if (strcmp(find_data.cFileName, ".") == 0 || strcmp(find_data.cFileName, "..") == 0)
+        {
+            continue;
+        }
+
+        char full_path[MAX_PATH];
+        if (snprintf(full_path, sizeof(full_path), "%s\\%s", base_path, find_data.cFileName) >= MAX_PATH)
+        {
+            continue;
+        }
+
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            // Recursively clean subdirectories and remove them if emptied
+            clean_directory_contents(full_path, 1, stats);
+        }
+        else
+        {
+            unsigned long long file_size =
+                ((unsigned long long)find_data.nFileSizeHigh << 32) | find_data.nFileSizeLow;
+
+            // Remove read-only flag if set so temporary files can be deleted
+            if (find_data.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+            {
+                SetFileAttributesA(full_path, find_data.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+            }
+
+            if (DeleteFileA(full_path))
+            {
+                stats->files_deleted++;
+                stats->bytes_freed += file_size;
+            }
+            else
+            {
+                // File is currently locked/in use by Windows or a running program
+                stats->files_skipped++;
+            }
+        }
+    } while (FindNextFileA(hFind, &find_data) != 0);
+
+    FindClose(hFind);
+
+    // Attempt to remove empty subdirectories (silently ignored if locked files remain inside)
+    if (remove_self)
+    {
+        RemoveDirectoryA(base_path);
+    }
+}
+
+// Option 3: Flush DNS Cache and Clear Windows Temporary Files
+// Note: Module workflow developed with assistance from Gemini AI
+void execute_cache_cleanup(void)
+{
+    char confirm = 'n';
+    printf(COLOR_CYAN "\n--- CACHE & TEMPORARY FILES CLEANUP ---\n" COLOR_RESET);
+    printf("This module will perform the following maintenance tasks:\n");
+    printf("  1. Flush the Windows DNS Resolver Cache (ipconfig /flushdns)\n");
+    printf("  2. Remove stale files in User Temp (%%TEMP%%)\n");
+    printf("  3. Remove stale files in System Temp (C:\\Windows\\Temp)\n");
+    printf("\nProceed with cleanup? (y/n): ");
+
+    if (scanf(" %c", &confirm) != 1)
+    {
+        while (getchar() != '\n');
+        confirm = 'n';
+    }
+    else
+    {
+        while (getchar() != '\n');
+    }
+
+    if (confirm != 'y' && confirm != 'Y')
+    {
+        printf(COLOR_YELLOW "\n[INFO] Cleanup cancelled. Returning to Main Menu.\n\n" COLOR_RESET);
+        return;
+    }
+
+    // Step 1: Flush DNS Resolver Cache
+    printf(COLOR_YELLOW "\n[1/3] Flushing DNS Resolver Cache...\n" COLOR_RESET);
+    printf("------------------------------------------------------------\n");
+    int dns_status = run_piped_command("C:\\Windows\\System32\\ipconfig.exe /flushdns");
+    printf("------------------------------------------------------------\n");
+    if (dns_status == 0)
+    {
+        printf(COLOR_GREEN "[OK] DNS cache flushed successfully.\n\n" COLOR_RESET);
+    }
+    else
+    {
+        printf(COLOR_RED "[WARNING] DNS flush returned exit code %d.\n\n" COLOR_RESET, dns_status);
+    }
+
+    CleanupStats stats = {0, 0, 0};
+
+    // Step 2: Clean Current User %TEMP% Directory
+    char user_temp[MAX_PATH];
+    DWORD path_len = GetTempPathA(MAX_PATH, user_temp);
+    if (path_len > 0 && path_len < MAX_PATH)
+    {
+        printf(COLOR_YELLOW "[2/3] Cleaning User Temp folder (%s)...\n" COLOR_RESET, user_temp);
+        clean_directory_contents(user_temp, 0, &stats);
+        printf(COLOR_GREEN "[OK] User Temp scan complete.\n\n" COLOR_RESET);
+    }
+    else
+    {
+        printf(COLOR_RED "[WARNING] Could not resolve User Temp directory path.\n\n" COLOR_RESET);
+    }
+
+    // Step 3: Clean System-Wide C:\Windows\Temp Directory
+    printf(COLOR_YELLOW "[3/3] Cleaning System Temp folder (C:\\Windows\\Temp)...\n" COLOR_RESET);
+    clean_directory_contents("C:\\Windows\\Temp", 0, &stats);
+    printf(COLOR_GREEN "[OK] System Temp scan complete.\n\n" COLOR_RESET);
+
+    // Summary Report
+    double mb_freed = (double)stats.bytes_freed / (1024.0 * 1024.0);
+    printf(COLOR_CYAN "============================================================\n");
+    printf("                 CLEANUP SUMMARY REPORT\n");
+    printf("============================================================\n" COLOR_RESET);
+    printf("  Temporary files removed : %lu\n", stats.files_deleted);
+    printf("  In-use files skipped    : %lu\n", stats.files_skipped);
+    printf("  Total disk space freed  : %.2f MB\n", mb_freed);
+    printf(COLOR_CYAN "============================================================\n\n" COLOR_RESET);
+}
+
