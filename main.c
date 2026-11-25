@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <time.h>
 
 // ANSI Escape Codes for Terminal Colors
 #define COLOR_RESET  "\033[0m"
@@ -13,6 +14,10 @@
 #define COLOR_GREEN  "\033[1;32m"
 #define COLOR_RED    "\033[1;31m"
 #define COLOR_YELLOW "\033[1;33m"
+
+// Defyning maximum log lines and line length for log generation
+#define MAX_RECENT_LOGS 15
+#define LOG_LINE_LEN 512
 
 // Data Struct to track cache and temporary file cleanup metrics
 typedef struct
@@ -22,6 +27,17 @@ typedef struct
     unsigned long long bytes_freed;
 } CleanupStats;
 
+// Data Struct to hold parsed CBS.log diagnostic metrics and system info
+typedef struct
+{
+    char timestamp[64];
+    char computer_name[MAX_COMPUTERNAME_LENGTH + 1];
+    unsigned long long uptime_minutes;
+    unsigned long total_sr_entries;
+    unsigned long repaired_count;
+    unsigned long unrepaired_count;
+    unsigned long scans_completed;
+} DiagnosticReport;
 
 // Function Prototypes
 int check_admin_privileges(void);
@@ -31,6 +47,7 @@ int run_piped_command(const char *command);
 void execute_deep_repair(void);
 void clean_directory_contents(const char *dir_path, int remove_self, CleanupStats *stats);
 void execute_cache_cleanup(void);
+void execute_log_generator(void);
 
 // Main Application Loop
 int main(void) {
@@ -77,7 +94,7 @@ int main(void) {
                 execute_cache_cleanup();
                 break;
             case 4:
-                printf(COLOR_YELLOW "\n[INFO] Generate Diagnostic Log - Coming Soon...\n\n" COLOR_RESET);
+                execute_log_generator();
                 break;
             case 5:
                 printf(COLOR_CYAN "\nExiting Diagnostic Tool. Goodbye!\n" COLOR_RESET);
@@ -413,3 +430,174 @@ void execute_cache_cleanup(void)
     printf(COLOR_CYAN "============================================================\n\n" COLOR_RESET);
 }
 
+// Option 4: Parse C:\Windows\Logs\CBS\CBS.log for [SR] entries and generate a report file
+// Note: Log parsing, circular buffer, and report formatting developed with assistance from Gemini AI
+void execute_log_generator(void)
+{
+    const char *cbs_path = "C:\\Windows\\Logs\\CBS\\CBS.log";
+    const char *report_filename = "sysfix_diagnostic_report.txt";
+
+    printf(COLOR_CYAN "\n--- GENERATE DIAGNOSTIC LOG REPORT ---\n" COLOR_RESET);
+    printf("Scanning %s for System Repair ([SR]) events...\n", cbs_path);
+
+    DiagnosticReport report = {0};
+
+    // 1. Capture current local timestamp
+    time_t now = time(NULL);
+    struct tm *local_time = localtime(&now);
+    if (local_time != NULL)
+    {
+        strftime(report.timestamp, sizeof(report.timestamp), "%Y-%m-%d %H:%M:%S", local_time);
+    }
+    else
+    {
+        strncpy(report.timestamp, "Unknown Timestamp", sizeof(report.timestamp) - 1);
+    }
+
+    // 2. Capture Windows machine name and uptime
+    DWORD name_size = sizeof(report.computer_name);
+    if (!GetComputerNameA(report.computer_name, &name_size))
+    {
+        strncpy(report.computer_name, "UNKNOWN-PC", sizeof(report.computer_name) - 1);
+    }
+    report.uptime_minutes = GetTickCount64() / (1000ULL * 60ULL);
+
+    // 3. Allocate a circular buffer on the heap for the most recent [SR] log entries
+    char **recent_logs = malloc(MAX_RECENT_LOGS * sizeof(char *));
+    if (recent_logs == NULL)
+    {
+        printf(COLOR_RED "[ERROR] Memory allocation failed for log buffer.\n\n" COLOR_RESET);
+        return;
+    }
+    for (int i = 0; i < MAX_RECENT_LOGS; i++)
+    {
+        recent_logs[i] = malloc(LOG_LINE_LEN * sizeof(char));
+        if (recent_logs[i] == NULL)
+        {
+            for (int j = 0; j < i; j++)
+            {
+                free(recent_logs[j]);
+            }
+            free(recent_logs);
+            printf(COLOR_RED "[ERROR] Memory allocation failed for log entry.\n\n" COLOR_RESET);
+            return;
+        }
+    }
+
+    int write_idx = 0;
+    int total_stored = 0;
+
+    // 4. Open and parse CBS.log line by line
+    FILE *cbs_file = fopen(cbs_path, "r");
+    if (cbs_file == NULL)
+    {
+        printf(COLOR_YELLOW "[WARNING] Could not open %s (file may be missing or locked).\n" COLOR_RESET, cbs_path);
+        printf("Generating system status report without CBS history...\n");
+    }
+    else
+    {
+        char line[1024];
+        while (fgets(line, sizeof(line), cbs_file) != NULL)
+        {
+            // Filter specifically for System File Checker [SR] tags
+            if (strstr(line, "[SR]") != NULL)
+            {
+                report.total_sr_entries++;
+
+                if (strstr(line, "Repairing") != NULL || strstr(line, "Repaired") != NULL)
+                {
+                    report.repaired_count++;
+                }
+                if (strstr(line, "Cannot repair") != NULL)
+                {
+                    report.unrepaired_count++;
+                }
+                if (strstr(line, "Verify complete") != NULL)
+                {
+                    report.scans_completed++;
+                }
+
+                // Store entry in circular buffer
+                strncpy(recent_logs[write_idx], line, LOG_LINE_LEN - 1);
+                recent_logs[write_idx][LOG_LINE_LEN - 1] = '\0';
+                write_idx = (write_idx + 1) % MAX_RECENT_LOGS;
+                if (total_stored < MAX_RECENT_LOGS)
+                {
+                    total_stored++;
+                }
+            }
+        }
+        fclose(cbs_file);
+    }
+
+    // 5. Write formatted diagnostic report to disk
+    FILE *out_file = fopen(report_filename, "w");
+    if (out_file == NULL)
+    {
+        printf(COLOR_RED "[ERROR] Failed to create output report file: %s\n\n" COLOR_RESET, report_filename);
+        for (int i = 0; i < MAX_RECENT_LOGS; i++)
+        {
+            free(recent_logs[i]);
+        }
+        free(recent_logs);
+        return;
+    }
+
+    fprintf(out_file, "====================================================================\n");
+    fprintf(out_file, "               SYSFIX - WINDOWS DIAGNOSTIC REPORT\n");
+    fprintf(out_file, "====================================================================\n");
+    fprintf(out_file, "Generated On       : %s\n", report.timestamp);
+    fprintf(out_file, "Computer Name      : %s\n", report.computer_name);
+    fprintf(out_file, "Administrator Mode : %s\n", check_admin_privileges() ? "Enabled (Elevated)" : "Disabled");
+    fprintf(out_file, "System Uptime      : %llu hours, %llu minutes\n",
+            report.uptime_minutes / 60ULL, report.uptime_minutes % 60ULL);
+    fprintf(out_file, "--------------------------------------------------------------------\n");
+    fprintf(out_file, "CBS / SYSTEM FILE CHECKER ([SR]) SUMMARY\n");
+    fprintf(out_file, "--------------------------------------------------------------------\n");
+    fprintf(out_file, "Total [SR] Log Entries   : %lu\n", report.total_sr_entries);
+    fprintf(out_file, "Verification Scans Found : %lu\n", report.scans_completed);
+    fprintf(out_file, "Corrupt Files Repaired   : %lu\n", report.repaired_count);
+    fprintf(out_file, "Unrepaired Corruptions   : %lu\n", report.unrepaired_count);
+    fprintf(out_file, "--------------------------------------------------------------------\n");
+    fprintf(out_file, "MOST RECENT [SR] LOG ENTRIES (UP TO %d)\n", MAX_RECENT_LOGS);
+    fprintf(out_file, "--------------------------------------------------------------------\n");
+
+    if (total_stored == 0)
+    {
+        fprintf(out_file, "No [SR] entries found in CBS.log.\n");
+    }
+    else
+    {
+        int start_idx = (total_stored < MAX_RECENT_LOGS) ? 0 : write_idx;
+        for (int i = 0; i < total_stored; i++)
+        {
+            int idx = (start_idx + i) % MAX_RECENT_LOGS;
+            size_t entry_len = strlen(recent_logs[idx]);
+            fprintf(out_file, "%s", recent_logs[idx]);
+            if (entry_len == 0 || recent_logs[idx][entry_len - 1] != '\n')
+            {
+                fprintf(out_file, "\n");
+            }
+        }
+    }
+
+    fprintf(out_file, "====================================================================\n");
+    fclose(out_file);
+
+    // 6. Free dynamically allocated circular buffer
+    for (int i = 0; i < MAX_RECENT_LOGS; i++)
+    {
+        free(recent_logs[i]);
+    }
+    free(recent_logs);
+
+    // Display summary in console
+    printf(COLOR_GREEN "\n[SUCCESS] Diagnostic report saved to: %s\n" COLOR_RESET, report_filename);
+    printf("------------------------------------------------------------\n");
+    printf("  Computer Name          : %s\n", report.computer_name);
+    printf("  System Uptime          : %lluh %llum\n", report.uptime_minutes / 60ULL, report.uptime_minutes % 60ULL);
+    printf("  Total [SR] Entries     : %lu\n", report.total_sr_entries);
+    printf("  Files Repaired         : %lu\n", report.repaired_count);
+    printf("  Unrepaired Corruptions : %lu\n", report.unrepaired_count);
+    printf("------------------------------------------------------------\n\n");
+}
